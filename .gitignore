@@ -1,0 +1,6 @@
+WeatherImageDataset
+*.DS_Store
+*.pyc
+metadata.json
+*.png
+*.ipynb_checkpoints
