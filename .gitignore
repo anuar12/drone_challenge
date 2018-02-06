@@ -4,3 +4,4 @@ WeatherImageDataset
 metadata.json
 *.png
 *.ipynb_checkpoints
+*.JPEG
