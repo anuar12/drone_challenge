@@ -5,41 +5,35 @@ import torchvision as tv
 import os
 import time
 
-args = {'num_classes': 4,
+args = {'last_hidden_units': 256,
         'batch_size': 64,
         'lr': 0.1,
         'workers': 1,
         'momentum': 0.9,
         'weight_decay': 1e-4,
         'start_epoch': 0,
-        'epochs': 6,
+        'epochs': 3,
         'print_freq': 10}
 
-#class CustomDenseNet(torch.nn.Module):
-#    def __init__(self):
-#        super(CustomDenseNet, self).__init__()
-#        densenet = tv.models.densenet121(pretrained=True)
-#        densenet.classifier = torch.nn.Linear(1024, args['num_classes'])
-#        self.densenet = densenet
-#        self.softmax = torch.nn.Softmax(dim=1)
-#    
-#    def forward(self, x):
-#        x = self.densenet(x)
-#        x = self.softmax(x)
-#        return x
-    
 class CustomDenseNet(torch.nn.Module):
     def __init__(self, pretrained_model):
         super(CustomDenseNet, self).__init__()
         self.pretrained_model = pretrained_model
-        self.last_layer = torch.nn.Linear(1024, args['num_classes'])
+        self.last_layer = torch.nn.Linear(1024, args['last_hidden_units'])
         self.pretrained_model.classifier = self.last_layer
+        self.relu = torch.nn.ReLU()
+        self.layer_w = torch.nn.Linear(args['last_hidden_units'], 4)
+        self.layer_s = torch.nn.Linear(args['last_hidden_units'], 5)
         self.softmax = torch.nn.Softmax(dim=1)
     
     def forward(self, x):
         x = self.pretrained_model(x)
-        x = self.softmax(x)
-        return x
+        x = self.relu(x)
+        x_w = self.layer_w(x)
+        x_s = self.layer_s(x)
+        x_w = self.softmax(x_w)
+        x_s = self.softmax(x_s)
+        return x_w, x_s
 
 model = CustomDenseNet(tv.models.densenet121(pretrained=True))
 model = model.cuda()
@@ -47,7 +41,7 @@ model = model.cuda()
 #    print(name)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, task):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -62,8 +56,14 @@ def train(train_loader, model, criterion, optimizer, epoch):
         input_var = torch.autograd.Variable(input).cuda(async=True)
         target_var = torch.autograd.Variable(target)
 
-        output = model(input_var)
-        loss = criterion(output, target_var)
+        output_w, output_s = model(input_var)
+        if 'weather' == task:
+            output = output_w
+            loss = criterion(output_w, target_var)
+        elif 'setting' == task:
+            output = output_s
+            loss = criterion(output_s, target_var)
+        else: raise ValueError()
 
         prec1, prec5 = accuracy(output.data, target, topk=(1, 3))
         prec1 = accuracy(output.data, target, topk=(1,))
@@ -81,7 +81,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
                      (epoch, i, len(train_loader), batch_time.val, losses.val, losses.avg, top1.val, top1.avg))
 
 
-def validate(val_loader, model, criterion, is_test=False):
+def validate(val_loader, model, criterion, task, is_test=False):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -94,8 +94,14 @@ def validate(val_loader, model, criterion, is_test=False):
         input_var = torch.autograd.Variable(input, volatile=True).cuda(async=True)
         target_var = torch.autograd.Variable(target, volatile=True)
 
-        output = model(input_var)
-        loss = criterion(output, target_var)
+        output_w, output_s = model(input_var)
+        if 'weather' == task:
+            output = output_w
+            loss = criterion(output_w, target_var)
+        elif 'setting' == task:
+            output = output_s
+            loss = criterion(output_s, target_var)
+        else: raise ValueError()
 
         prec1 = accuracy(output.data, target)
         losses.update(loss.data[0], input.size(0))
@@ -109,6 +115,7 @@ def validate(val_loader, model, criterion, is_test=False):
             print('Val: %d / %d; Time: %.2fs; Loss: %.2f (%.2f); Accuracy: %.1f (%.1f)' %\
                     (i, len(val_loader), batch_time.val, losses.val, losses.avg, top1.val, top1.avg))
         if is_test: print(target_var.data, output.data)
+    print("Overall average accuracy on validation: ", top1.avg)
 
     return top1.avg
 
@@ -157,53 +164,68 @@ def make_weights_for_balanced_classes(images, nclasses):
     for i in range(nclasses):                                                   
         weight_per_class[i] = N/float(count[i])                                 
     print("Weight per class: ", weight_per_class)
-    weight_per_class = [2., 20., 10., 2.]
+    #weight_per_class = [2., 20., 10., 2.]
     weight = [0] * len(images)                                              
     for idx, val in enumerate(images):                                          
         weight[idx] = weight_per_class[val[1]]                                  
     return weight   
 
 
-current_dir = os.getcwd()
-data_path = current_dir + '/WeatherImageDataset'
-train_dir = data_path + '/train'
-val_dir = data_path + '/val'
-test_dir = data_path + '/test'
 normalize = tv.transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
-dataset_train = tv.datasets.ImageFolder(train_dir, tv.transforms.Compose([
-        tv.transforms.RandomSizedCrop(224),
-        tv.transforms.RandomHorizontalFlip(),
-        tv.transforms.ToTensor(),
-        normalize]))
-weights = make_weights_for_balanced_classes(dataset_train.imgs, len(dataset_train.classes))    
-weights = torch.DoubleTensor(weights) 
-sampler = torch.utils.data.sampler.WeightedRandomSampler(weights, len(weights))   
 
-train_loader = torch.utils.data.DataLoader(
-    dataset_train, #sampler=sampler, 
-    batch_size=args['batch_size'], shuffle=True,
-    num_workers=args['workers'], pin_memory=True)
+def get_data_loader(data_dir):
+    
+    dataset_folder = tv.datasets.ImageFolder(data_dir, tv.transforms.Compose([
+            tv.transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.8, 1.2)),
+            tv.transforms.RandomHorizontalFlip(),
+            tv.transforms.ToTensor(),
+            normalize]))
+    if 'train' in data_dir:
+        weights = make_weights_for_balanced_classes(dataset_folder.imgs,\
+                                                    len(dataset_folder.classes)) 
+        weights = torch.DoubleTensor(weights) 
+        sampler = torch.utils.data.sampler.WeightedRandomSampler(weights, len(weights))
+        is_shuffle = False
+    else:
+        sampler = None
+        is_shuffle = True
 
-val_loader = torch.utils.data.DataLoader(
-    tv.datasets.ImageFolder(val_dir, tv.transforms.Compose([
-        tv.transforms.Scale(256),
-        tv.transforms.CenterCrop(224),
-        tv.transforms.ToTensor(),
-        normalize,
-    ])),
-    batch_size=args['batch_size'], shuffle=False,
-    num_workers=args['workers'], pin_memory=True)
+    dataset_loader = torch.utils.data.DataLoader(
+        dataset_folder, sampler=sampler, 
+        batch_size=args['batch_size'], shuffle=is_shuffle,
+        num_workers=args['workers'], pin_memory=True)
+
+    return dataset_loader
+
+current_dir = os.getcwd()
+data_path_w = current_dir + '/WeatherImageDataset'
+data_path_s = current_dir + '/imagenet'
+train_dir_w = data_path_w + '/train'
+val_dir_w = data_path_w + '/val'
+train_dir_s = data_path_s + '/train'
+val_dir_s = data_path_s + '/val'
+test_dir = data_path_w + '/test'
+
+train_loader_w = get_data_loader(train_dir_w)
+val_loader_w = get_data_loader(val_dir_w)
+train_loader_s = get_data_loader(train_dir_s)
+val_loader_s = get_data_loader(val_dir_s)
+
 
 test_loader = torch.utils.data.DataLoader(
     tv.datasets.ImageFolder(test_dir, tv.transforms.Compose([
-        tv.transforms.Scale(256),
+        tv.transforms.Resize(256),
         tv.transforms.CenterCrop(224),
-        tv.transforms.ToTensor(), normalize])))
+        tv.transforms.ToTensor(),
+        normalize])))
 
 criterion = torch.nn.CrossEntropyLoss().cuda()
 
 ignored_params = list(map(id, model.last_layer.parameters()))
+ignored_params += list(map(id, model.layer_w.parameters()))
+ignored_params += list(map(id, model.layer_s.parameters()))
+print(ignored_params)
 base_params = filter(lambda p: id(p) not in ignored_params,
                      model.parameters())
 
@@ -213,22 +235,40 @@ optimizer = torch.optim.SGD([
 			    lr=args['lr']*0.25,
                             momentum=args['momentum'],
                             weight_decay=args['weight_decay'])
-#optimizer = torch.optim.SGD(model.parameters(), args['lr'],
-#                            momentum=args['momentum'],
-#                            weight_decay=args['weight_decay'])
 
 # if args.evaluate:
 #     validate(val_loader, model, criterion)
+list_of_tasks = ['weather', 'setting']
 best_prec1 = 0
 for epoch in range(args['start_epoch'], args['epochs']):
     print("\n\t\t==========  NEW EPOCH  =========")
     adjust_learning_rate(optimizer, epoch)
+    for task in list_of_tasks:
+        if task == 'weather':
+            print("\t\t========== Training For Weather ==========")
+            train_loader = train_loader_w
+            val_loader = val_loader_w
+            for name, param in model.named_parameters():
+                if 'layer_w' in name:
+                    param.requires_grad = True
+                if 'layer_s' in name:
+                    param.requires_grad = False
+        if task == 'setting':
+            print("\t\t========== Training For Setting ==========")
+            train_loader = train_loader_s
+            val_loader = val_loader_s
+            for name, param in model.named_parameters():
+                if 'layer_s' in name:
+                    param.requires_grad = True
+                if 'layer_w' in name:
+                    param.requires_grad = False
 
-    train(train_loader, model, criterion, optimizer, epoch)
-    prec1 = validate(val_loader, model, criterion)
+        train(train_loader, model, criterion, optimizer, epoch, task)
+        prec1 = validate(val_loader, model, criterion, task)
 
-    is_best = prec1 > best_prec1
-    #best_prec1 = max(prec1, best_prec1)
+        is_best = prec1 > best_prec1
+        #best_prec1 = max(prec1, best_prec1)
 
-prec_test = validate(test_loader, model, criterion, is_test=True)
+prec_test = validate(test_loader, model, criterion, 'weather', is_test=True)
+prec_test = validate(test_loader, model, criterion, 'setting', is_test=True)
 
