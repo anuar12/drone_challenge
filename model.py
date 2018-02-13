@@ -3,27 +3,32 @@ import numpy as np
 import torch
 import torchvision as tv
 import os
+import sys
 import time
+import pprint
+from imblearn.metrics import classification_report_imbalanced
 
 args = {'last_hidden_units': 256,
-        'batch_size': 64,
+        'batch_size': 32,
         'lr': 0.1,
         'workers': 1,
         'momentum': 0.9,
         'weight_decay': 1e-4,
         'start_epoch': 0,
-        'epochs': 3,
+        'epochs': 30,
         'print_freq': 10}
+pprint.pprint(args)
 
-class CustomDenseNet(torch.nn.Module):
+class CustomPreTrained(torch.nn.Module):
     def __init__(self, pretrained_model):
-        super(CustomDenseNet, self).__init__()
+        super(CustomPreTrained, self).__init__()
         self.pretrained_model = pretrained_model
         self.last_layer = torch.nn.Linear(1024, args['last_hidden_units'])
         self.pretrained_model.classifier = self.last_layer
         self.relu = torch.nn.ReLU()
         self.layer_w = torch.nn.Linear(args['last_hidden_units'], 4)
         self.layer_s = torch.nn.Linear(args['last_hidden_units'], 5)
+        self.layer_d = torch.nn.Linear(args['last_hidden_units'], 3)
         self.softmax = torch.nn.Softmax(dim=1)
     
     def forward(self, x):
@@ -31,11 +36,14 @@ class CustomDenseNet(torch.nn.Module):
         x = self.relu(x)
         x_w = self.layer_w(x)
         x_s = self.layer_s(x)
+        x_d = self.layer_d(x)
         x_w = self.softmax(x_w)
         x_s = self.softmax(x_s)
-        return x_w, x_s
+        x_d = self.softmax(x_d)
+        return x_w, x_s, x_d
 
-model = CustomDenseNet(tv.models.densenet121(pretrained=True))
+model = CustomPreTrained(tv.models.densenet121(pretrained=True))
+#model = CustomPreTrained(tv.models.squeezenet1_1(pretrained=True))
 model = model.cuda()
 #for name, module, in model.named_parameters():
 #    print(name)
@@ -46,23 +54,26 @@ def train(train_loader, model, criterion, optimizer, epoch, task):
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-    top5 = AverageMeter()
     model.train()
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
+        if i > 100: break
         data_time.update(time.time() - end)
 
         target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input).cuda(async=True)
         target_var = torch.autograd.Variable(target)
 
-        output_w, output_s = model(input_var)
+        output_w, output_s, output_d = model(input_var)
         if 'weather' == task:
             output = output_w
             loss = criterion(output_w, target_var)
         elif 'setting' == task:
             output = output_s
             loss = criterion(output_s, target_var)
+        elif 'daytime' == task:
+            output = output_d
+            loss = criterion(output_d, target_var)
         else: raise ValueError()
 
         prec1, prec5 = accuracy(output.data, target, topk=(1, 3))
@@ -81,41 +92,47 @@ def train(train_loader, model, criterion, optimizer, epoch, task):
                      (epoch, i, len(train_loader), batch_time.val, losses.val, losses.avg, top1.val, top1.avg))
 
 
-def validate(val_loader, model, criterion, task, is_test=False):
+def validate(val_loader, model, criterion, task, is_test=False, is_report=False):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-    top5 = AverageMeter()
+    top2 = AverageMeter()
 
     model.eval()
     end = time.time()
+    targets = []
     for i, (input, target) in enumerate(val_loader):
+        #if is_report: targets += target
         target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True).cuda(async=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
+        input_var = torch.autograd.Variable(input).cuda(async=True)
+        target_var = torch.autograd.Variable(target)
 
-        output_w, output_s = model(input_var)
+        output_w, output_s, output_d = model(input_var)
         if 'weather' == task:
             output = output_w
             loss = criterion(output_w, target_var)
         elif 'setting' == task:
             output = output_s
             loss = criterion(output_s, target_var)
+        elif 'daytime' == task:
+            output = output_d
+            loss = criterion(output_d, target_var)
         else: raise ValueError()
 
-        prec1 = accuracy(output.data, target)
+        prec1, prec2 = accuracy(output.data, target, topk=(1, 2))
         losses.update(loss.data[0], input.size(0))
         top1.update(prec1[0], input.size(0))
+        top2.update(prec2[0], input.size(0))
 
         batch_time.update(time.time() - end)
         end = time.time()
 
         print_freq = 2*args['print_freq'] if not is_test else 1
         if i % print_freq == 0:
-            print('Val: %d / %d; Time: %.2fs; Loss: %.2f (%.2f); Accuracy: %.1f (%.1f)' %\
-                    (i, len(val_loader), batch_time.val, losses.val, losses.avg, top1.val, top1.avg))
-        if is_test: print(target_var.data, output.data)
-    print("Overall average accuracy on validation: ", top1.avg)
+            print('Val: %d / %d; Time: %.2fs; Loss: %.2f (%.2f); Acc-1: %.1f (%.1f), Acc-2: %.1f (%.1f)' %\
+                    (i, len(val_loader), batch_time.val, losses.val, losses.avg, top1.val, top1.avg, top2.val, top2.avg))
+        if is_test: print(target_var.data[0], output.data[0])
+    print("Overall average accuracy on validation: %.1f, %.1f" % (top1.avg, top2.avg))
 
     return top1.avg
 
@@ -136,7 +153,7 @@ class AverageMeter(object):
 
 def adjust_learning_rate(optimizer, epoch):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args['lr'] * (0.1 ** (epoch // 30))
+    lr = args['lr'] * (0.1 ** (epoch // 20))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -198,24 +215,48 @@ def get_data_loader(data_dir):
 
     return dataset_loader
 
+def save_checkpoint(state, filename='checkpoint.pth.tar'):
+    torch.save(state, filename)
+    #if is_best:
+    #    shutil.copyfile(filename, 'model_best.pth.tar')
+
 current_dir = os.getcwd()
 data_path_w = current_dir + '/WeatherImageDataset'
-data_path_s = current_dir + '/imagenet'
+data_path_s = current_dir + '/SettingDataset'
+data_path_d = current_dir + '/DaytimeDataset'
 train_dir_w = data_path_w + '/train'
 val_dir_w = data_path_w + '/val'
 train_dir_s = data_path_s + '/train'
 val_dir_s = data_path_s + '/val'
-test_dir = data_path_w + '/test'
+train_dir_d = data_path_d + '/train'
+val_dir_d = data_path_d + '/val'
+test_dir_w = data_path_w + '/test'
+test_dir_s = data_path_s + '/test'
+test_dir_d = data_path_d + '/test'
 
 train_loader_w = get_data_loader(train_dir_w)
 val_loader_w = get_data_loader(val_dir_w)
 train_loader_s = get_data_loader(train_dir_s)
 val_loader_s = get_data_loader(val_dir_s)
+train_loader_d = get_data_loader(train_dir_d)
+val_loader_d = get_data_loader(val_dir_d)
 
 
-test_loader = torch.utils.data.DataLoader(
-    tv.datasets.ImageFolder(test_dir, tv.transforms.Compose([
-        tv.transforms.Resize(256),
+test_loader_w = torch.utils.data.DataLoader(
+    tv.datasets.ImageFolder(test_dir_w, tv.transforms.Compose([
+        tv.transforms.Resize(224),
+        tv.transforms.CenterCrop(224),
+        tv.transforms.ToTensor(),
+        normalize])))
+test_loader_s = torch.utils.data.DataLoader(
+    tv.datasets.ImageFolder(test_dir_s, tv.transforms.Compose([
+        tv.transforms.Resize(224),
+        tv.transforms.CenterCrop(224),
+        tv.transforms.ToTensor(),
+        normalize])))
+test_loader_d = torch.utils.data.DataLoader(
+    tv.datasets.ImageFolder(test_dir_d, tv.transforms.Compose([
+        tv.transforms.Resize(224),
         tv.transforms.CenterCrop(224),
         tv.transforms.ToTensor(),
         normalize])))
@@ -225,20 +266,23 @@ criterion = torch.nn.CrossEntropyLoss().cuda()
 ignored_params = list(map(id, model.last_layer.parameters()))
 ignored_params += list(map(id, model.layer_w.parameters()))
 ignored_params += list(map(id, model.layer_s.parameters()))
+ignored_params += list(map(id, model.layer_d.parameters()))
 print(ignored_params)
 base_params = filter(lambda p: id(p) not in ignored_params,
                      model.parameters())
 
 optimizer = torch.optim.SGD([
             {'params': base_params},
-            {'params': model.last_layer.parameters(), 'lr': args['lr']}],\
-			    lr=args['lr']*0.25,
+            {'params': model.last_layer.parameters(),\
+	     'lr': args['lr'], 'momentum': args['momentum'],
+	     'weight_decay': args['weight_decay']}],\
+			    lr=args['lr']*0.2,
                             momentum=args['momentum'],
                             weight_decay=args['weight_decay'])
 
 # if args.evaluate:
 #     validate(val_loader, model, criterion)
-list_of_tasks = ['weather', 'setting']
+list_of_tasks = ['weather', 'setting', 'daytime']
 best_prec1 = 0
 for epoch in range(args['start_epoch'], args['epochs']):
     print("\n\t\t==========  NEW EPOCH  =========")
@@ -253,7 +297,9 @@ for epoch in range(args['start_epoch'], args['epochs']):
                     param.requires_grad = True
                 if 'layer_s' in name:
                     param.requires_grad = False
-        if task == 'setting':
+                if 'layer_d' in name:
+                    param.requires_grad = False
+        elif task == 'setting':
             print("\t\t========== Training For Setting ==========")
             train_loader = train_loader_s
             val_loader = val_loader_s
@@ -262,6 +308,20 @@ for epoch in range(args['start_epoch'], args['epochs']):
                     param.requires_grad = True
                 if 'layer_w' in name:
                     param.requires_grad = False
+                if 'layer_d' in name:
+                    param.requires_grad = False
+        elif task == 'daytime':
+            print("\t\t========== Training For Daytime ==========")
+            train_loader = train_loader_d
+            val_loader = val_loader_d
+            for name, param in model.named_parameters():
+                if 'layer_d' in name:
+                    param.requires_grad = True
+                if 'layer_s' in name:
+                    param.requires_grad = False
+                if 'layer_w' in name:
+                    param.requires_grad = False
+        else: raise ValueError()
 
         train(train_loader, model, criterion, optimizer, epoch, task)
         prec1 = validate(val_loader, model, criterion, task)
@@ -269,6 +329,21 @@ for epoch in range(args['start_epoch'], args['epochs']):
         is_best = prec1 > best_prec1
         #best_prec1 = max(prec1, best_prec1)
 
-prec_test = validate(test_loader, model, criterion, 'weather', is_test=True)
-prec_test = validate(test_loader, model, criterion, 'setting', is_test=True)
+
+print("\n\tValidating...")
+prec1 = validate(val_loader_w, model, criterion, 'weather', is_report=True)
+prec1 = validate(val_loader_s, model, criterion, 'setting', is_report=True)
+prec1 = validate(val_loader_d, model, criterion, 'daytime', is_report=True)
+print("\n\t\t========== Testing For Weather ==========")
+prec_test = validate(test_loader_w, model, criterion, 'weather', is_test=True)
+print("\t\t========== Testing For Setting ==========")
+prec_test = validate(test_loader_s, model, criterion, 'setting', is_test=True)
+print("\t\t========== Testing For Daytime ==========")
+prec_test = validate(test_loader_d, model, criterion, 'setting', is_test=True)
+
+save_checkpoint({
+    'epoch': args['epochs'] + 1,
+    'arch': 'densenet',
+    'state_dict': model.state_dict(),
+    'best_prec1': prec1})
 
