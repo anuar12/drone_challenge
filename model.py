@@ -15,8 +15,8 @@ args = {'last_hidden_units': 256,
         'momentum': 0.9,
         'weight_decay': 1e-4,
         'start_epoch': 0,
-        'epochs': 200,
-        'print_freq': 10}
+        'epochs': 600,
+        'print_freq': 9}
 pprint.pprint(args)
 
 class CustomPreTrained(torch.nn.Module):
@@ -24,11 +24,15 @@ class CustomPreTrained(torch.nn.Module):
         super(CustomPreTrained, self).__init__()
         self.pretrained_model = pretrained_model
         self.last_layer = torch.nn.Linear(1024, args['last_hidden_units'])
+        self.last_layer.bias.data.zero_()
         self.pretrained_model.classifier = self.last_layer
         self.relu = torch.nn.ReLU()
         self.layer_w = torch.nn.Linear(args['last_hidden_units'], 4)
         self.layer_s = torch.nn.Linear(args['last_hidden_units'], 5)
         self.layer_d = torch.nn.Linear(args['last_hidden_units'], 3)
+        self.layer_w.bias.data.zero_()
+        self.layer_s.bias.data.zero_()
+        self.layer_d.bias.data.zero_()
         self.softmax = torch.nn.Softmax(dim=1)
     
     def forward(self, x):
@@ -42,43 +46,10 @@ class CustomPreTrained(torch.nn.Module):
         x_d = self.softmax(x_d)
         return x_w, x_s, x_d
 
-class CustomPreTrained2(torch.nn.Module):
-    def __init__(self, pretrained_model):
-        super(CustomPreTrained2, self).__init__()
-        self.features = pretrained_model.features
-        self.relu = torch.nn.ReLU()
-        self.avg_pool = torch.nn.avg_pool2d(7, 1)
-
-        self.layer_w_dense1 = torch.nn.Conv2d(1024, args['last_hidden_units'], 7)
-        self.layer_s_dense1 = torch.nn.Conv2d(1024, args['last_hidden_units'], 7)
-        self.layer_d_dense1 = torch.nn.Conv2d(1024, args['last_hidden_units'], 7)
-        self.layer_w_dense = torch.nn.Linear(args['last_hidden_units'], 4)
-        self.layer_s_dense = torch.nn.Linear(args['last_hidden_units'], 5)
-        self.layer_d_dense = torch.nn.Linear(args['last_hidden_units'], 3)
-        self.softmax = torch.nn.Softmax(dim=1)
-    
-    def forward(self, x):
-        features = self.features(x)
-        x = self.relu(features)
-
-        x_w_dense1 = self.relu(self.layer_w_dense1(x)).view(features.size(0), -1)
-        x_s_dense1 = self.relu(self.layer_s_dense1(x)).view(features.size(0), -1)
-        x_d_dense1 = self.relu(self.layer_d_dense1(x)).view(features.size(0), -1)
-
-        x_w = self.layer_w_dense(x_w_dense1)
-        x_s = self.layer_s_dense(x_s_dense1)
-        x_d = self.layer_d_dense(x_d_dense1)
-        x_w = self.softmax(x_w)
-        x_s = self.softmax(x_s)
-        x_d = self.softmax(x_d)
-        return x_w, x_s, x_d
 
 model = CustomPreTrained(tv.models.densenet121(pretrained=True))
-#model = CustomPreTrained2(tv.models.squeezenet1_1(pretrained=True))
+#model = CustomPreTrained(tv.models.squeezenet1_1(pretrained=True))
 model = model.cuda()
-#for name, module, in model.named_parameters():
-#    print(name)
-
 
 def train(train_loader, model, criterion, optimizer, epoch, task):
     batch_time = AverageMeter()
@@ -86,11 +57,13 @@ def train(train_loader, model, criterion, optimizer, epoch, task):
     losses = AverageMeter()
     local_ave_loss = []
     all_losses = []
+    local_ave_acc = []
+    all_accs = []
     top1 = AverageMeter()
     model.train()
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
-        if i > 50: break
+        if i > 10: break
         data_time.update(time.time() - end)
 
         target = target.cuda(async=True)
@@ -115,9 +88,12 @@ def train(train_loader, model, criterion, optimizer, epoch, task):
         top1.update(prec1[0], input.size(0))
 
         local_ave_loss.append(loss.data[0])
+        local_ave_acc.append(top1.avg)
         if i % 10 == 0 and i > 1:
             all_losses.append(sum(local_ave_loss) / 10)
+            all_accs.append(sum(local_ave_acc) / 10)
             local_ave_loss = []
+            local_ave_acc = []
 
         optimizer.zero_grad()
         loss.backward()
@@ -128,7 +104,7 @@ def train(train_loader, model, criterion, optimizer, epoch, task):
         if i % args['print_freq'] == 0:
             print("Epoch %d [%d/%d], Time: %.2f, Loss: %.3f (%.3f), Accuracy: %.1f (%.1f)" %\
                      (epoch, i, len(train_loader), batch_time.val, losses.val, losses.avg, top1.val, top1.avg))
-    return all_losses
+    return all_losses, all_accs
 
 
 def validate(val_loader, model, criterion, task, is_test=False, is_report=False):
@@ -141,7 +117,7 @@ def validate(val_loader, model, criterion, task, is_test=False, is_report=False)
     end = time.time()
     targets = []
     for i, (input, target) in enumerate(val_loader):
-        if i > 50: break
+        if i > 100: break
         #if is_report: targets += target
         target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input).cuda(async=True)
@@ -193,7 +169,7 @@ class AverageMeter(object):
 
 def adjust_learning_rate(optimizer, epoch):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args['lr'] * (0.2 ** (epoch // 100))
+    lr = args['lr'] * (0.2 ** (epoch // 450))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -304,12 +280,6 @@ test_loader_d = torch.utils.data.DataLoader(
 
 criterion = torch.nn.CrossEntropyLoss().cuda()
 
-#ignored_params = list(map(id, model.layer_w_dense1.parameters()))
-#ignored_params += list(map(id, model.layer_s_dense1.parameters()))
-#ignored_params += list(map(id, model.layer_d_dense1.parameters()))
-#ignored_params += list(map(id, model.layer_w_dense.parameters()))
-#ignored_params += list(map(id, model.layer_s_dense.parameters()))
-#ignored_params += list(map(id, model.layer_d_dense.parameters()))
 
 ignored_params = list(map(id, model.last_layer.parameters()))
 ignored_params += list(map(id, model.layer_s.parameters()))
@@ -335,24 +305,6 @@ optimizer = torch.optim.SGD([
                             momentum=args['momentum'],
                             weight_decay=args['weight_decay'])
 
-#optimizer = torch.optim.SGD([
-#            {'params': base_params},
-#	    {'params': model.layer_w_dense1.parameters(), 'lr': args['lr'],\
-#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
-#	    {'params': model.layer_s_dense1.parameters(), 'lr': args['lr'],\
-#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
-#	    {'params': model.layer_d_dense1.parameters(), 'lr': args['lr'],\
-#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
-#	    {'params': model.layer_w_dense.parameters(), 'lr': args['lr'],\
-#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
-#	    {'params': model.layer_s_dense.parameters(), 'lr': args['lr'],\
-#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
-#            {'params': model.layer_d_dense.parameters(), 'lr': args['lr'],\
-#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']}],
-#			    lr=args['lr']*0.2,
-#                            momentum=args['momentum'],
-#                            weight_decay=args['weight_decay'])
-
 # if args.evaluate:
 #     validate(val_loader, model, criterion)
 list_of_tasks = ['weather', 'setting', 'daytime']
@@ -360,6 +312,9 @@ best_prec1 = 0
 all_losses_w = []
 all_losses_s = []
 all_losses_d = []
+all_accs_w = []
+all_accs_s = []
+all_accs_d = []
 for epoch in range(args['start_epoch'], args['epochs']):
     print("\n\t\t==========  NEW EPOCH  =========")
     adjust_learning_rate(optimizer, epoch)
@@ -399,22 +354,28 @@ for epoch in range(args['start_epoch'], args['epochs']):
                     param.requires_grad = False
         else: raise ValueError()
 
-        epoch_losses = train(train_loader, model, criterion, optimizer, epoch, task)
+        epoch_losses, epoch_accs = train(train_loader, model, criterion, optimizer, epoch, task)
         if task == 'weather':
-            all_losses_w.append(epoch_losses)
+            all_losses_w += epoch_losses
+            all_accs_w += epoch_accs
         elif task == 'setting':
-            all_losses_s.append(epoch_losses)
+            all_losses_s += epoch_losses
+            all_accs_s += epoch_accs
         elif task == 'daytime':
-            all_losses_d.append(epoch_losses)
+            all_losses_d += epoch_losses
+            all_accs_d += epoch_accs
 
-    if epoch % 7 == 0:
+    if epoch % 25 == 0:
         prec1 = validate(val_loader_w, model, criterion, 'weather')
         prec1 = validate(val_loader_s, model, criterion, 'setting')
         prec1 = validate(val_loader_d, model, criterion, 'daytime')
 
-np.save('losses_w', all_losses_w)
-np.save('losses_s', all_losses_s)
-np.save('losses_d', all_losses_d)
+np.save('losses_w_10_b', all_losses_w)
+np.save('losses_s_10_b', all_losses_s)
+np.save('losses_d_10_b', all_losses_d)
+np.save('accs_w_10_b', all_accs_w)
+np.save('accs_s_10_b', all_accs_s)
+np.save('accs_d_10_b', all_accs_d)
 
 print("\n\tFinal Validation...")
 prec1 = validate(val_loader_w, model, criterion, 'weather', is_report=True)

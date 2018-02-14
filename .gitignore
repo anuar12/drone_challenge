@@ -5,3 +5,15 @@ metadata.json
 *.png
 *.ipynb_checkpoints
 *.JPEG
+imagenet/
+*.out
+*.err
+
+
+DaytimeDataset/train/
+DaytimeDataset/val/
+SettingDataset/train/
+SettingDataset/val/
+WeatherImageDataset/train/
+WeatherImageDataset/val/
+OpenImages/
