@@ -15,7 +15,7 @@ args = {'last_hidden_units': 256,
         'momentum': 0.9,
         'weight_decay': 1e-4,
         'start_epoch': 0,
-        'epochs': 30,
+        'epochs': 200,
         'print_freq': 10}
 pprint.pprint(args)
 
@@ -42,8 +42,39 @@ class CustomPreTrained(torch.nn.Module):
         x_d = self.softmax(x_d)
         return x_w, x_s, x_d
 
+class CustomPreTrained2(torch.nn.Module):
+    def __init__(self, pretrained_model):
+        super(CustomPreTrained2, self).__init__()
+        self.features = pretrained_model.features
+        self.relu = torch.nn.ReLU()
+        self.avg_pool = torch.nn.avg_pool2d(7, 1)
+
+        self.layer_w_dense1 = torch.nn.Conv2d(1024, args['last_hidden_units'], 7)
+        self.layer_s_dense1 = torch.nn.Conv2d(1024, args['last_hidden_units'], 7)
+        self.layer_d_dense1 = torch.nn.Conv2d(1024, args['last_hidden_units'], 7)
+        self.layer_w_dense = torch.nn.Linear(args['last_hidden_units'], 4)
+        self.layer_s_dense = torch.nn.Linear(args['last_hidden_units'], 5)
+        self.layer_d_dense = torch.nn.Linear(args['last_hidden_units'], 3)
+        self.softmax = torch.nn.Softmax(dim=1)
+    
+    def forward(self, x):
+        features = self.features(x)
+        x = self.relu(features)
+
+        x_w_dense1 = self.relu(self.layer_w_dense1(x)).view(features.size(0), -1)
+        x_s_dense1 = self.relu(self.layer_s_dense1(x)).view(features.size(0), -1)
+        x_d_dense1 = self.relu(self.layer_d_dense1(x)).view(features.size(0), -1)
+
+        x_w = self.layer_w_dense(x_w_dense1)
+        x_s = self.layer_s_dense(x_s_dense1)
+        x_d = self.layer_d_dense(x_d_dense1)
+        x_w = self.softmax(x_w)
+        x_s = self.softmax(x_s)
+        x_d = self.softmax(x_d)
+        return x_w, x_s, x_d
+
 model = CustomPreTrained(tv.models.densenet121(pretrained=True))
-#model = CustomPreTrained(tv.models.squeezenet1_1(pretrained=True))
+#model = CustomPreTrained2(tv.models.squeezenet1_1(pretrained=True))
 model = model.cuda()
 #for name, module, in model.named_parameters():
 #    print(name)
@@ -53,11 +84,13 @@ def train(train_loader, model, criterion, optimizer, epoch, task):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+    local_ave_loss = []
+    all_losses = []
     top1 = AverageMeter()
     model.train()
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
-        if i > 100: break
+        if i > 50: break
         data_time.update(time.time() - end)
 
         target = target.cuda(async=True)
@@ -81,6 +114,11 @@ def train(train_loader, model, criterion, optimizer, epoch, task):
         losses.update(loss.data[0], input.size(0))
         top1.update(prec1[0], input.size(0))
 
+        local_ave_loss.append(loss.data[0])
+        if i % 10 == 0 and i > 1:
+            all_losses.append(sum(local_ave_loss) / 10)
+            local_ave_loss = []
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -90,6 +128,7 @@ def train(train_loader, model, criterion, optimizer, epoch, task):
         if i % args['print_freq'] == 0:
             print("Epoch %d [%d/%d], Time: %.2f, Loss: %.3f (%.3f), Accuracy: %.1f (%.1f)" %\
                      (epoch, i, len(train_loader), batch_time.val, losses.val, losses.avg, top1.val, top1.avg))
+    return all_losses
 
 
 def validate(val_loader, model, criterion, task, is_test=False, is_report=False):
@@ -102,6 +141,7 @@ def validate(val_loader, model, criterion, task, is_test=False, is_report=False)
     end = time.time()
     targets = []
     for i, (input, target) in enumerate(val_loader):
+        if i > 50: break
         #if is_report: targets += target
         target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input).cuda(async=True)
@@ -153,7 +193,7 @@ class AverageMeter(object):
 
 def adjust_learning_rate(optimizer, epoch):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args['lr'] * (0.1 ** (epoch // 20))
+    lr = args['lr'] * (0.2 ** (epoch // 100))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -180,6 +220,7 @@ def make_weights_for_balanced_classes(images, nclasses):
     N = float(sum(count))                                                   
     for i in range(nclasses):                                                   
         weight_per_class[i] = N/float(count[i])                                 
+    weight_per_class = [min(x, 15.) for x in weight_per_class]  # clip the largest value
     print("Weight per class: ", weight_per_class)
     #weight_per_class = [2., 20., 10., 2.]
     weight = [0] * len(images)                                              
@@ -191,14 +232,14 @@ def make_weights_for_balanced_classes(images, nclasses):
 normalize = tv.transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
 
-def get_data_loader(data_dir):
+def get_data_loader(data_dir, is_balanced=False):
     
     dataset_folder = tv.datasets.ImageFolder(data_dir, tv.transforms.Compose([
-            tv.transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.8, 1.2)),
+            tv.transforms.RandomResizedCrop(224, scale=(0.7, 1.0), ratio=(0.8, 1.2)),
             tv.transforms.RandomHorizontalFlip(),
             tv.transforms.ToTensor(),
             normalize]))
-    if 'train' in data_dir:
+    if 'train' in data_dir or is_balanced:
         weights = make_weights_for_balanced_classes(dataset_folder.imgs,\
                                                     len(dataset_folder.classes)) 
         weights = torch.DoubleTensor(weights) 
@@ -240,50 +281,85 @@ train_loader_s = get_data_loader(train_dir_s)
 val_loader_s = get_data_loader(val_dir_s)
 train_loader_d = get_data_loader(train_dir_d)
 val_loader_d = get_data_loader(val_dir_d)
+val_loader_w_bal = get_data_loader(val_dir_w, is_balanced=True)
+val_loader_s_bal = get_data_loader(val_dir_s, is_balanced=True)
+val_loader_d_bal = get_data_loader(val_dir_d, is_balanced=True)
 
 
 test_loader_w = torch.utils.data.DataLoader(
     tv.datasets.ImageFolder(test_dir_w, tv.transforms.Compose([
-        tv.transforms.Resize(224),
-        tv.transforms.CenterCrop(224),
+        tv.transforms.Resize((224, 224)),
         tv.transforms.ToTensor(),
         normalize])))
 test_loader_s = torch.utils.data.DataLoader(
     tv.datasets.ImageFolder(test_dir_s, tv.transforms.Compose([
-        tv.transforms.Resize(224),
-        tv.transforms.CenterCrop(224),
+        tv.transforms.Resize((224, 224)),
         tv.transforms.ToTensor(),
         normalize])))
 test_loader_d = torch.utils.data.DataLoader(
     tv.datasets.ImageFolder(test_dir_d, tv.transforms.Compose([
-        tv.transforms.Resize(224),
-        tv.transforms.CenterCrop(224),
+        tv.transforms.Resize((224, 224)),
         tv.transforms.ToTensor(),
         normalize])))
 
 criterion = torch.nn.CrossEntropyLoss().cuda()
 
+#ignored_params = list(map(id, model.layer_w_dense1.parameters()))
+#ignored_params += list(map(id, model.layer_s_dense1.parameters()))
+#ignored_params += list(map(id, model.layer_d_dense1.parameters()))
+#ignored_params += list(map(id, model.layer_w_dense.parameters()))
+#ignored_params += list(map(id, model.layer_s_dense.parameters()))
+#ignored_params += list(map(id, model.layer_d_dense.parameters()))
+
 ignored_params = list(map(id, model.last_layer.parameters()))
-ignored_params += list(map(id, model.layer_w.parameters()))
 ignored_params += list(map(id, model.layer_s.parameters()))
 ignored_params += list(map(id, model.layer_d.parameters()))
+ignored_params += list(map(id, model.layer_w.parameters()))
 print(ignored_params)
 base_params = filter(lambda p: id(p) not in ignored_params,
                      model.parameters())
-
+addit_params = filter(lambda p: id(p) in ignored_params,
+                     model.parameters())
+# TODO
 optimizer = torch.optim.SGD([
             {'params': base_params},
-            {'params': model.last_layer.parameters(),\
-	     'lr': args['lr'], 'momentum': args['momentum'],
-	     'weight_decay': args['weight_decay']}],\
+	    {'params': model.last_layer.parameters(), 'lr': args['lr'],\
+                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
+	    {'params': model.layer_w.parameters(), 'lr': args['lr'],\
+                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
+	    {'params': model.layer_s.parameters(), 'lr': args['lr'],\
+                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
+            {'params': model.layer_d.parameters(), 'lr': args['lr'],\
+                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']}],
 			    lr=args['lr']*0.2,
                             momentum=args['momentum'],
                             weight_decay=args['weight_decay'])
+
+#optimizer = torch.optim.SGD([
+#            {'params': base_params},
+#	    {'params': model.layer_w_dense1.parameters(), 'lr': args['lr'],\
+#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
+#	    {'params': model.layer_s_dense1.parameters(), 'lr': args['lr'],\
+#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
+#	    {'params': model.layer_d_dense1.parameters(), 'lr': args['lr'],\
+#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
+#	    {'params': model.layer_w_dense.parameters(), 'lr': args['lr'],\
+#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
+#	    {'params': model.layer_s_dense.parameters(), 'lr': args['lr'],\
+#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']},
+#            {'params': model.layer_d_dense.parameters(), 'lr': args['lr'],\
+#                    'momentum': args['momentum'], 'weight_decay': args['weight_decay']}],
+#			    lr=args['lr']*0.2,
+#                            momentum=args['momentum'],
+#                            weight_decay=args['weight_decay'])
 
 # if args.evaluate:
 #     validate(val_loader, model, criterion)
 list_of_tasks = ['weather', 'setting', 'daytime']
 best_prec1 = 0
+all_losses_w = []
+all_losses_s = []
+all_losses_d = []
 for epoch in range(args['start_epoch'], args['epochs']):
     print("\n\t\t==========  NEW EPOCH  =========")
     adjust_learning_rate(optimizer, epoch)
@@ -323,17 +399,31 @@ for epoch in range(args['start_epoch'], args['epochs']):
                     param.requires_grad = False
         else: raise ValueError()
 
-        train(train_loader, model, criterion, optimizer, epoch, task)
-        prec1 = validate(val_loader, model, criterion, task)
+        epoch_losses = train(train_loader, model, criterion, optimizer, epoch, task)
+        if task == 'weather':
+            all_losses_w.append(epoch_losses)
+        elif task == 'setting':
+            all_losses_s.append(epoch_losses)
+        elif task == 'daytime':
+            all_losses_d.append(epoch_losses)
 
-        is_best = prec1 > best_prec1
-        #best_prec1 = max(prec1, best_prec1)
+    if epoch % 7 == 0:
+        prec1 = validate(val_loader_w, model, criterion, 'weather')
+        prec1 = validate(val_loader_s, model, criterion, 'setting')
+        prec1 = validate(val_loader_d, model, criterion, 'daytime')
 
+np.save('losses_w', all_losses_w)
+np.save('losses_s', all_losses_s)
+np.save('losses_d', all_losses_d)
 
-print("\n\tValidating...")
+print("\n\tFinal Validation...")
 prec1 = validate(val_loader_w, model, criterion, 'weather', is_report=True)
 prec1 = validate(val_loader_s, model, criterion, 'setting', is_report=True)
 prec1 = validate(val_loader_d, model, criterion, 'daytime', is_report=True)
+print("\n\tFinal Balanced Validation...")
+prec1 = validate(val_loader_w_bal, model, criterion, 'weather', is_report=True)
+prec1 = validate(val_loader_s_bal, model, criterion, 'setting', is_report=True)
+prec1 = validate(val_loader_d_bal, model, criterion, 'daytime', is_report=True)
 print("\n\t\t========== Testing For Weather ==========")
 prec_test = validate(test_loader_w, model, criterion, 'weather', is_test=True)
 print("\t\t========== Testing For Setting ==========")
@@ -343,7 +433,7 @@ prec_test = validate(test_loader_d, model, criterion, 'setting', is_test=True)
 
 save_checkpoint({
     'epoch': args['epochs'] + 1,
-    'arch': 'densenet',
+    'arch': 'densenet_conv',
     'state_dict': model.state_dict(),
     'best_prec1': prec1})
 
